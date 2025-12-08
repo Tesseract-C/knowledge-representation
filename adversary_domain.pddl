@@ -4,7 +4,9 @@
 
     (:types
         location - object
-        chaser thief player - object
+        adversary - object
+        chaser thief - adversary
+        player - object
     )
 
     (:predicates

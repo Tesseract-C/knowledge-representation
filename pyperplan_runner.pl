@@ -1,5 +1,5 @@
 % Usage (Windows example):
-% ?- run_pyperplan_soln('C:/ProgramData/anaconda3/Scripts/pyperplan.exe', 'domain.1.pddl', 'problem.1.pddl', Plan),
+% ?- run_pyperplan_soln('pyperplan', 'domain.1.pddl', 'problem.1.pddl', Plan),
 %    maplist(writeln, Plan).
 % Pyperplan is a lightweight planner. So negation (i.e. not) in preconditions is not allowed.
 
@@ -13,20 +13,59 @@
 :- use_module(library(pcre)).
 
 %% run_pyperplan_soln(+Exe, +DomainPDDL, +ProblemPDDL, -Actions:list) is det.
-%  Calls pyperplan (no redirection). Expects solver to write ProblemPDDL+'.soln'.
+%  Calls pyperplan (with full path on Windows). Expects solver to write ProblemPDDL+'.soln'.
 %  After the process exits, reads and parses that .soln file.
+%  Tries multiple approaches for Windows compatibility.
 run_pyperplan_soln(Exe, Domain, Problem, Actions) :-
     soln_path_(Problem, SolnFile),
-    setup_call_cleanup(
-        process_create(Exe, [Domain, Problem],
-                       [ stdout(null),              % don't capture logs
-                         stderr(pipe(Err)),         % capture errors
-                         process(PID)
-                       ]),
-        read_string(Err, _, Stderr),
-        close(Err)
+    % Try multiple approaches in order of preference
+    ( % First: direct execution with full path on Windows
+      catch(
+        ( find_executable_path(Exe, FullPath),
+          format('Trying execution of ~w (full path: ~w)...~n', [Exe, FullPath]),
+          setup_call_cleanup(
+            process_create(FullPath, [Domain, Problem],
+                           [ stdout(null),              % don't capture logs
+                             stderr(pipe(Err1)),        % capture errors
+                             process(PID1)
+                           ]),
+            read_string(Err1, _, Stderr1),
+            close(Err1)
+          ),
+          process_wait(PID1, exit(Status1))
+        ),
+        error(existence_error(source_sink, _), _),
+        % If direct path fails, try python -m approach (alternative)
+        ( format('Direct execution of ~w failed, trying python -m approach...~n', [Exe]),
+          catch(
+            ( setup_call_cleanup(
+                process_create('python', ['-m', Exe, Domain, Problem],
+                               [ stdout(null),              % don't capture logs
+                                 stderr(pipe(Err2)),        % capture errors
+                                 process(PID2)
+                               ]),
+                read_string(Err2, _, Stderr2),
+                close(Err2)
+              ),
+              process_wait(PID2, exit(Status2))
+            ),
+            error(existence_error(source_sink, _), _),
+            % If both approaches fail, report error
+            ( format('Both direct and python approaches failed~n', []),
+              throw(error(failed_to_execute_pyperplan, _))
+            )
+          )
+        )
+      )
+    ) ->
+      % Determine which status and stderr to use
+      ( (nonvar(Status1) -> Status = Status1, Stderr = Stderr1
+       ; Status = Status2, Stderr = Stderr2
+       )
+    ; % All approaches failed
+      throw(error(existence_error(source_sink, Exe), _))
     ),
-    process_wait(PID, exit(Status)),
+    % Handle the result
     ( exists_file(SolnFile)
     -> read_plan_file(SolnFile, Actions)
     ;  ( Status = exit(0)
@@ -35,6 +74,47 @@ run_pyperplan_soln(Exe, Domain, Problem, Actions) :-
           throw(error(pyperplan_failed(Status), _))
        )
     ).
+
+% Helper predicate to find full path of executable on Windows
+find_executable_path(Exe, FullPath) :-
+    atom(Exe),
+    current_prolog_flag(windows, true),
+    !,
+    ( Exe == 'pyperplan' ->
+        % Directly use the known path for pyperplan on Windows
+        FullPath = 'C:/Users/winnie/AppData/Local/Programs/Python/Python312/Scripts/pyperplan.exe',
+        ( exists_file(FullPath) -> true
+        ;   format('Warning: Expected pyperplan at ~w but file does not exist~n', [FullPath]),
+            FullPath = Exe  % fallback to command name if file doesn't exist
+        )
+    ; % For other executables, use where command
+        atom_string(Exe, ExeString),
+        format(atom(Cmd), 'where ~w', [ExeString]),
+        ( catch(
+            ( setup_call_cleanup(
+                process_create(path(cmd), ['/c', Cmd],
+                               [ stdout(pipe(Out)),
+                                 stderr(null),
+                                 process(_PID)
+                               ]),
+                read_string(Out, _, Output),
+                close(Out)
+              ),
+              % Process the output
+              split_string(Output, "\n", "\r\t ", [FirstPath|_]),
+              ( FirstPath \= "" ->
+                  string_codes(FirstPath, Codes),
+                  catch(atom_codes(FullPath, Codes), _, FullPath = Exe)
+              ; FullPath = Exe  % fallback if no path found
+              )
+            ),
+            _,
+            FullPath = Exe  % fallback on error
+        )
+    )).
+% On non-Windows systems, just use the given name
+find_executable_path(Exe, FullPath) :-
+    FullPath = Exe.
 
 %% read_plan_file(+SolnFile, -Actions:list) is det.
 %  Reads a pyperplan .soln file and parses action lines like:
